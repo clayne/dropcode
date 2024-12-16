@@ -1,10 +1,14 @@
+/* define either USE_VBO or USE_DLIST (or none for no OpenGL calls at all) */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <limits.h>
 #include <float.h>
 #include <assert.h>
+#if defined(USE_VBO) || defined(USE_DLIST)
 #include "opengl.h"
+#endif
 #include "cmesh.h"
 
 
@@ -12,8 +16,11 @@ struct cmesh_vattrib {
 	int nelem;	/* num elements per attribute [1, 4] */
 	float *data;
 	unsigned int count;	/* number of floats in data */
+#ifdef USE_VBO
 	unsigned int vbo;
-	int vbo_valid, data_valid;
+	int vbo_valid;
+#endif
+	int data_valid;
 };
 
 /* istart,icount are valid only when the mesh is indexed, otherwise icount is 0.
@@ -33,7 +40,7 @@ struct cmesh {
 	char *name;
 	unsigned int nverts, nfaces;
 
-	struct submesh *sublist, *subtail;
+	struct submesh *sublist;
 	int subcount;
 
 	/* current value for each attribute for the immediate mode interface */
@@ -44,12 +51,20 @@ struct cmesh {
 
 	unsigned int *idata;
 	unsigned int icount;
+#ifdef USE_VBO
 	unsigned int ibo;
-	int ibo_valid, idata_valid;
+	int ibo_valid;
+#endif
+	int idata_valid;
+#ifdef USE_DLIST
+	int dlist;
+#endif
 
+#ifdef USE_VBO
 	/* index buffer for wireframe rendering (constructed on demand) */
 	unsigned int wire_ibo;
 	int wire_ibo_valid;
+#endif
 
 	/* axis-aligned bounding box */
 	cgm_vec3 aabb_min, aabb_max;
@@ -62,15 +77,18 @@ struct cmesh {
 
 
 static int clone(struct cmesh *cmdest, const struct cmesh *cmsrc, struct submesh *sub);
-static int pre_draw(const struct cmesh *cm);
+static int pre_draw(const struct cmesh *cm, int start);
 static void post_draw(const struct cmesh *cm, int cur_sdr);
 static void update_buffers(struct cmesh *cm);
+#ifdef USE_VBO
 static void update_wire_ibo(struct cmesh *cm);
+#endif
 static void calc_aabb(struct cmesh *cm);
 static void calc_bsph(struct cmesh *cm);
 
 static int def_nelem[CMESH_NUM_ATTR] = {3, 3, 3, 2, 4, 4, 4, 2};
 
+#ifdef USE_SDR
 static int sdr_loc[CMESH_NUM_ATTR] = {0, 1, 2, 3, 4, 5, 6, 7};
 static int use_custom_sdr_attr;
 
@@ -93,6 +111,7 @@ void cmesh_clear_attrib_sdrloc(void)
 		sdr_loc[i] = -1;
 	}
 }
+#endif	/* USE_SDR */
 
 /* mesh functions */
 struct cmesh *cmesh_alloc(void)
@@ -117,11 +136,14 @@ void cmesh_free(struct cmesh *cm)
 
 int cmesh_init(struct cmesh *cm)
 {
+#ifdef USE_VBO
 	int i;
+#endif
 
 	memset(cm, 0, sizeof *cm);
 	cgm_wcons(cm->cur_val + CMESH_ATTR_COLOR, 1, 1, 1, 1);
 
+#ifdef USE_VBO
 	glGenBuffers(CMESH_NUM_ATTR + 1, cm->buffer_objects);
 
 	for(i=0; i<CMESH_NUM_ATTR; i++) {
@@ -129,6 +151,7 @@ int cmesh_init(struct cmesh *cm)
 	}
 
 	cm->ibo = cm->buffer_objects[CMESH_NUM_ATTR];
+#endif
 	return 0;
 }
 
@@ -145,10 +168,17 @@ void cmesh_destroy(struct cmesh *cm)
 
 	cmesh_clear_submeshes(cm);
 
+#ifdef USE_VBO
 	glDeleteBuffers(CMESH_NUM_ATTR + 1, cm->buffer_objects);
 	if(cm->wire_ibo) {
 		glDeleteBuffers(1, &cm->wire_ibo);
 	}
+#endif
+#ifdef USE_DLIST
+	if(cm->dlist) {
+		glDeleteList(cm->dlist, 1);
+	}
+#endif
 }
 
 void cmesh_clear(struct cmesh *cm)
@@ -157,19 +187,32 @@ void cmesh_clear(struct cmesh *cm)
 
 	for(i=0; i<CMESH_NUM_ATTR; i++) {
 		cm->vattr[i].nelem = 0;
+#ifdef USE_VBO
 		cm->vattr[i].vbo_valid = 0;
 		cm->vattr[i].data_valid = 0;
+#endif
 		free(cm->vattr[i].data);
 		cm->vattr[i].data = 0;
 		cm->vattr[i].count = 0;
 	}
-	cm->ibo_valid = cm->idata_valid = 0;
+#ifdef USE_VBO
+	cm->ibo_valid = 0;
+#endif
+	cm->idata_valid = 0;
 	free(cm->idata);
 	cm->idata = 0;
 	cm->icount = 0;
 
+#ifdef USE_VBO
 	cm->wire_ibo_valid = 0;
+#endif
 	cm->nverts = cm->nfaces = 0;
+
+#ifdef USE_DLIST
+	if(cm->dlist) {
+		glDeleteList(cm->dlist, 1);
+	}
+#endif
 
 	cm->bsph_valid = cm->aabb_valid = 0;
 
@@ -250,7 +293,9 @@ static int clone(struct cmesh *cmdest, const struct cmesh *cmsrc, struct submesh
 			vptr = cmsrc->vattr[i].data + vstart * nelem;
 			memcpy(cmdest->vattr[i].data, vptr, vcount * nelem * sizeof(float));
 			cmdest->vattr[i].data_valid = 1;
+#ifdef USE_VBO
 			cmdest->vattr[i].vbo_valid = 0;
+#endif
 		} else {
 			memset(cmdest->vattr + i, 0, sizeof cmdest->vattr[i]);
 		}
@@ -274,7 +319,10 @@ static int clone(struct cmesh *cmdest, const struct cmesh *cmsrc, struct submesh
 		cmdest->idata_valid = 1;
 	} else {
 		cmdest->idata = 0;
-		cmdest->idata_valid = cmdest->ibo_valid = 0;
+		cmdest->idata_valid = 0;
+#ifdef USE_VBO
+		cmdest->ibo_valid = 0;
+#endif
 	}
 
 	free(cmdest->name);
@@ -319,7 +367,6 @@ static int clone(struct cmesh *cmdest, const struct cmesh *cmsrc, struct submesh
 		}
 
 		cmdest->sublist = head;
-		cmdest->subtail = tail;
 		cmdest->subcount = cmsrc->subcount;
 	}
 
@@ -347,12 +394,20 @@ int cmesh_has_attrib(const struct cmesh *cm, int attr)
 	if(attr < 0 || attr >= CMESH_NUM_ATTR) {
 		return 0;
 	}
+#ifdef USE_VBO
 	return cm->vattr[attr].vbo_valid | cm->vattr[attr].data_valid;
+#else
+	return cm->vattr[attr].data_valid;
+#endif
 }
 
 int cmesh_indexed(const struct cmesh *cm)
 {
+#ifdef USE_VBO
 	return cm->ibo_valid | cm->idata_valid;
+#else
+	return cm->idata_valid;
+#endif
 }
 
 /* vdata can be 0, in which case only memory is allocated
@@ -384,7 +439,15 @@ float *cmesh_set_attrib(struct cmesh *cm, int attr, int nelem, unsigned int num,
 	cm->vattr[attr].count = num * nelem;
 	cm->vattr[attr].nelem = nelem;
 	cm->vattr[attr].data_valid = 1;
+#ifdef USE_VBO
 	cm->vattr[attr].vbo_valid = 0;
+#endif
+#ifdef USE_DLIST
+	if(cm->dlist) {
+		glDeleteLists(cm->dlist, 1);
+		cm->dlist = 0;
+	}
+#endif
 	return newarr;
 }
 
@@ -393,23 +456,30 @@ float *cmesh_attrib(struct cmesh *cm, int attr)
 	if(attr < 0 || attr >= CMESH_NUM_ATTR) {
 		return 0;
 	}
+#ifdef USE_VBO
 	cm->vattr[attr].vbo_valid = 0;
+#endif
+#ifdef USE_DLIST
+	if(cm->dlist) {
+		glDeleteLists(cm->dlist, 1);
+		cm->dlist = 0;
+	}
+#endif
 	return (float*)cmesh_attrib_ro(cm, attr);
 }
 
 const float *cmesh_attrib_ro(const struct cmesh *cm, int attr)
 {
-	void *tmp;
-	int nelem;
-
 	if(attr < 0 || attr >= CMESH_NUM_ATTR) {
 		return 0;
 	}
 
 	if(!cm->vattr[attr].data_valid) {
-#if GL_ES_VERSION_2_0
+#if GL_ES_VERSION_2_0 || !defined(USE_VBO)
 		return 0;
 #else
+		void *tmp;
+		int nelem;
 		struct cmesh *m = (struct cmesh*)cm;
 
 		if(!m->vattr[attr].vbo_valid) {
@@ -478,7 +548,15 @@ int cmesh_push_attrib(struct cmesh *cm, int attr, float *v)
 		*vptr++ = *v++;
 	}
 	cm->vattr[attr].data_valid = 1;
+#ifdef USE_VBO
 	cm->vattr[attr].vbo_valid = 0;
+#endif
+#ifdef USE_DLIST
+	if(cm->dlist) {
+		glDeleteLists(cm->dlist, 1);
+		cm->dlist = 0;
+	}
+#endif
 
 	if(attr == CMESH_ATTR_VERTEX) {
 		cm->nverts = newsz / cm->vattr[attr].nelem;
@@ -549,25 +627,40 @@ unsigned int *cmesh_set_index(struct cmesh *cm, int num, const unsigned int *ind
 	cm->icount = num;
 	cm->nfaces = num / 3;
 	cm->idata_valid = 1;
+#ifdef USE_VBO
 	cm->ibo_valid = 0;
+#endif
+#ifdef USE_DLIST
+	if(cm->dlist) {
+		glDeleteLists(cm->dlist, 1);
+		cm->dlist = 0;
+	}
+#endif
 	return tmp;
 }
 
 unsigned int *cmesh_index(struct cmesh *cm)
 {
+#ifdef USE_VBO
 	cm->ibo_valid = 0;
+#endif
+#ifdef USE_DLIST
+	if(cm->dlist) {
+		glDeleteLists(cm->dlist, 1);
+		cm->dlist = 0;
+	}
+#endif
 	return (unsigned int*)cmesh_index_ro(cm);
 }
 
 const unsigned int *cmesh_index_ro(const struct cmesh *cm)
 {
-	int nidx;
-	unsigned int *tmp;
-
 	if(!cm->idata_valid) {
-#if GL_ES_VERSION_2_0
+#if GL_ES_VERSION_2_0 || !defined(USE_VBO)
 		return 0;
 #else
+		int nidx;
+		unsigned int *tmp;
 		struct cmesh *m = (struct cmesh*)cm;
 
 		if(!m->ibo_valid) {
@@ -610,7 +703,15 @@ int cmesh_push_index(struct cmesh *cm, unsigned int idx)
 	cm->idata = iptr;
 	cm->icount = cur_sz + 1;
 	cm->idata_valid = 1;
+#ifdef USE_VBO
 	cm->ibo_valid = 0;
+#endif
+#ifdef USE_DLIST
+	if(cm->dlist) {
+		glDeleteLists(cm->dlist, 1);
+		cm->dlist = 0;
+	}
+#endif
 
 	cm->nfaces = cm->icount / 3;
 	return 0;
@@ -630,6 +731,7 @@ int cmesh_poly_count(const struct cmesh *cm)
 /* attr can be -1 to invalidate all attributes */
 void cmesh_invalidate_vbo(struct cmesh *cm, int attr)
 {
+#ifdef USE_VBO
 	int i;
 
 	if(attr >= CMESH_NUM_ATTR) {
@@ -643,11 +745,26 @@ void cmesh_invalidate_vbo(struct cmesh *cm, int attr)
 	} else {
 		cm->vattr[attr].vbo_valid = 0;
 	}
+#endif
+#ifdef USE_DLIST
+	if(cm->dlist) {
+		glDeleteLists(cm->dlist, 1);
+		cm->dlist = 0;
+	}
+#endif
 }
 
 void cmesh_invalidate_index(struct cmesh *cm)
 {
+#ifdef USE_VBO
 	cm->ibo_valid = 0;
+#endif
+#ifdef USE_DLIST
+	if(cm->dlist) {
+		glDeleteLists(cm->dlist, 1);
+		cm->dlist = 0;
+	}
+#endif
 }
 
 int cmesh_append(struct cmesh *cmdest, const struct cmesh *cmsrc)
@@ -708,7 +825,9 @@ int cmesh_append(struct cmesh *cmdest, const struct cmesh *cmsrc)
 	cmdest->nverts += cmsrc->nverts;
 	cmdest->nfaces += cmsrc->nfaces;
 
+#ifdef USE_VBO
 	cmdest->wire_ibo_valid = 0;
+#endif
 	cmdest->aabb_valid = 0;
 	cmdest->bsph_valid = 0;
 	return 0;
@@ -725,7 +844,6 @@ void cmesh_clear_submeshes(struct cmesh *cm)
 		free(sm);
 	}
 	cm->subcount = 0;
-	cm->subtail = 0;
 }
 
 int cmesh_submesh(struct cmesh *cm, const char *name, int fstart, int fcount)
@@ -765,13 +883,8 @@ int cmesh_submesh(struct cmesh *cm, const char *name, int fstart, int fcount)
 		sm->vcount = fcount * 3;
 	}
 
-	sm->next = 0;
-	if(cm->sublist) {
-		cm->subtail->next = sm;
-		cm->subtail = sm;
-	} else {
-		cm->sublist = cm->subtail = sm;
-	}
+	sm->next = cm->sublist;
+	cm->sublist = sm;
 	cm->subcount++;
 	return 0;
 }
@@ -798,18 +911,10 @@ int cmesh_remove_submesh(struct cmesh *cm, int idx)
 	free(sm->name);
 	free(sm);
 
-	if(cm->subtail == sm) {
-		cm->subtail = prev;
-	}
-
 	cm->subcount--;
 	assert(cm->subcount >= 0);
 
-	if(!dummy.next) {
-		cm->sublist = cm->subtail = 0;
-	} else {
-		cm->sublist = dummy.next;
-	}
+	cm->sublist = dummy.next;
 	return 0;
 }
 
@@ -873,7 +978,10 @@ int cmesh_vertex(struct cmesh *cm, float x, float y, float z)
 		cm->idata = 0;
 		cm->icount = 0;
 	}
-	cm->ibo_valid = cm->idata_valid = 0;
+#ifdef USE_VBO
+	cm->ibo_valid = 0;
+#endif
+	cm->idata_valid = 0;
 	return 0;
 }
 
@@ -1010,8 +1118,9 @@ void cmesh_flip_faces(struct cmesh *cm)
 		nelem = cm->vattr[CMESH_ATTR_VERTEX].nelem;
 		for(i=0; i<vnum; i+=3) {
 			for(j=0; j<nelem; j++) {
+				float tmp;
 				vptr = verts + (i + 1) * nelem + j;
-				float tmp = vptr[nelem];
+				tmp = vptr[nelem];
 				vptr[nelem] = vptr[0];
 				vptr[0] = tmp;
 			}
@@ -1071,7 +1180,15 @@ int cmesh_explode(struct cmesh *cm)
 		cm->vattr[i].data_valid = 1;
 	}
 
+#ifdef USE_VBO
 	cm->ibo_valid = 0;
+#endif
+#ifdef USE_DLIST
+	if(cm->dlist) {
+		glDeleteLists(cm->dlist, 1);
+		cm->dlist = 0;
+	}
+#endif
 	cm->idata_valid = 0;
 	free(cm->idata);
 	cm->idata = 0;
@@ -1087,18 +1204,25 @@ void cmesh_calc_face_normals(struct cmesh *cm)
 	/* TODO */
 }
 
-static int pre_draw(const struct cmesh *cm)
+static int pre_draw(const struct cmesh *cm, int start)
 {
-	int i, loc, cur_sdr;
+	int cur_sdr;
 
+#ifdef USE_SDR
+	int i, loc;
 	glGetIntegerv(GL_CURRENT_PROGRAM, &cur_sdr);
+#else
+	cur_sdr = 0;
+#endif
 
 	update_buffers((struct cmesh*)cm);
 
+#ifdef USE_VBO
 	if(!cm->vattr[CMESH_ATTR_VERTEX].vbo_valid) {
 		return -1;
 	}
 
+#ifdef USE_SDR
 	if(cur_sdr && use_custom_sdr_attr) {
 		if(sdr_loc[CMESH_ATTR_VERTEX] == -1) {
 			return -1;
@@ -1113,6 +1237,7 @@ static int pre_draw(const struct cmesh *cm)
 			}
 		}
 	} else {
+#endif	/* USE_SDR */
 #ifndef GL_ES_VERSION_2_0
 		glBindBuffer(GL_ARRAY_BUFFER, cm->vattr[CMESH_ATTR_VERTEX].vbo);
 		glVertexPointer(cm->vattr[CMESH_ATTR_VERTEX].nelem, GL_FLOAT, 0, 0);
@@ -1141,8 +1266,44 @@ static int pre_draw(const struct cmesh *cm)
 			glClientActiveTexture(GL_TEXTURE0);
 		}
 #endif	/* GL_ES_VERSION_2_0 */
+#ifdef USE_SDR
 	}
+#endif
 	glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+#else	/* !USE_VBO */
+
+#ifdef USE_DLIST
+	if(cm->dlist && !start) {
+		return cur_sdr;
+	}
+#endif
+	{
+		const struct cmesh_vattrib *vattr;
+
+		vattr = cm->vattr + CMESH_ATTR_VERTEX;
+		glEnableClientState(GL_VERTEX_ARRAY);
+		glVertexPointer(vattr->nelem, GL_FLOAT, 0, vattr->data + start * vattr->nelem);
+
+		vattr = cm->vattr + CMESH_ATTR_NORMAL;
+		if(vattr->data_valid) {
+			glEnableClientState(GL_NORMAL_ARRAY);
+			glNormalPointer(GL_FLOAT, 0, vattr->data + start * 3);
+		}
+
+		vattr = cm->vattr + CMESH_ATTR_TEXCOORD;
+		if(vattr->data_valid) {
+			glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+			glTexCoordPointer(vattr->nelem, GL_FLOAT, 0, vattr->data + start * vattr->nelem);
+		}
+
+		vattr = cm->vattr + CMESH_ATTR_COLOR;
+		if(vattr->data_valid) {
+			glEnableClientState(GL_COLOR_ARRAY);
+			glColorPointer(vattr->nelem, GL_FLOAT, 0, vattr->data + start * vattr->nelem);
+		}
+	}
+#endif	/* !USE_VBO */
 	return cur_sdr;
 }
 
@@ -1150,10 +1311,11 @@ void cmesh_draw(const struct cmesh *cm)
 {
 	int cur_sdr;
 
-	if((cur_sdr = pre_draw(cm)) == -1) {
+	if((cur_sdr = pre_draw(cm, 0)) == -1) {
 		return;
 	}
 
+#ifdef USE_VBO
 	if(cm->ibo_valid) {
 		glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, cm->ibo);
 		glDrawElements(GL_TRIANGLES, cm->nfaces * 3, GL_UNSIGNED_INT, 0);
@@ -1161,6 +1323,18 @@ void cmesh_draw(const struct cmesh *cm)
 	} else {
 		glDrawArrays(GL_TRIANGLES, 0, cm->nverts);
 	}
+#else
+#ifdef USE_DLIST
+	if(cm->dlist) {
+		glCallList(cm->dlist);
+	} else
+#endif
+	if(cm->idata_valid) {
+		glDrawElements(GL_TRIANGLES, cm->nfaces * 3, GL_UNSIGNED_INT, cm->idata);
+	} else {
+		glDrawArrays(GL_TRIANGLES, 0, cm->nverts);
+	}
+#endif
 
 	post_draw(cm, cur_sdr);
 }
@@ -1169,10 +1343,11 @@ void cmesh_draw_range(const struct cmesh *cm, int start, int count)
 {
 	int cur_sdr;
 
-	if((cur_sdr = pre_draw(cm)) == -1) {
+	if((cur_sdr = pre_draw(cm, start)) == -1) {
 		return;
 	}
 
+#ifdef USE_VBO
 	if(cm->ibo_valid) {
 		glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, cm->ibo);
 		glDrawElements(GL_TRIANGLES, count, GL_UNSIGNED_INT, (void*)(intptr_t)(start * 4));
@@ -1180,6 +1355,13 @@ void cmesh_draw_range(const struct cmesh *cm, int start, int count)
 	} else {
 		glDrawArrays(GL_TRIANGLES, start, count);
 	}
+#else
+	if(cm->idata_valid) {
+		glDrawElements(GL_TRIANGLES, count, GL_UNSIGNED_INT, cm->idata + start);
+	} else {
+		glDrawArrays(GL_TRIANGLES, start, count);
+	}
+#endif
 
 	post_draw(cm, cur_sdr);
 }
@@ -1202,9 +1384,10 @@ void cmesh_draw_submesh(const struct cmesh *cm, int subidx)
 
 static void post_draw(const struct cmesh *cm, int cur_sdr)
 {
-	int i;
-
+#ifdef USE_VBO
+#ifdef USE_SDR
 	if(cur_sdr && use_custom_sdr_attr) {
+		int i;
 		for(i=0; i<CMESH_NUM_ATTR; i++) {
 			int loc = sdr_loc[i];
 			if(loc >= 0 && cm->vattr[i].vbo_valid) {
@@ -1212,6 +1395,7 @@ static void post_draw(const struct cmesh *cm, int cur_sdr)
 			}
 		}
 	} else {
+#endif	/* USE_SDR */
 #ifndef GL_ES_VERSION_2_0
 		glDisableClientState(GL_VERTEX_ARRAY);
 		if(cm->vattr[CMESH_ATTR_NORMAL].vbo_valid) {
@@ -1229,14 +1413,23 @@ static void post_draw(const struct cmesh *cm, int cur_sdr)
 			glClientActiveTexture(GL_TEXTURE0);
 		}
 #endif	/* GL_ES_VERSION_2_0 */
+#ifdef USE_SDR
 	}
+#endif
+#else	/* !USE_VBO */
+	glDisableClientState(GL_VERTEX_ARRAY);
+	glDisableClientState(GL_NORMAL_ARRAY);
+	glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+	glDisableClientState(GL_COLOR_ARRAY);
+#endif
 }
 
 void cmesh_draw_wire(const struct cmesh *cm, float linesz)
 {
+#ifdef USE_VBO
 	int cur_sdr, nfaces;
 
-	if((cur_sdr = pre_draw(cm)) == -1) {
+	if((cur_sdr = pre_draw(cm, 0)) == -1) {
 		return;
 	}
 	update_wire_ibo((struct cmesh*)cm);
@@ -1247,12 +1440,13 @@ void cmesh_draw_wire(const struct cmesh *cm, float linesz)
 	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
 
 	post_draw(cm, cur_sdr);
+#endif
 }
 
 void cmesh_draw_vertices(const struct cmesh *cm, float ptsz)
 {
 	int cur_sdr;
-	if((cur_sdr = pre_draw(cm)) == -1) {
+	if((cur_sdr = pre_draw(cm, 0)) == -1) {
 		return;
 	}
 
@@ -1267,8 +1461,10 @@ void cmesh_draw_vertices(const struct cmesh *cm, float ptsz)
 void cmesh_draw_normals(const struct cmesh *cm, float len)
 {
 #ifndef GL_ES_VERSION_2_0
-	int i, cur_sdr, vert_nelem, norm_nelem;
-	int loc = -1;
+	int i, vert_nelem, norm_nelem;
+#ifdef USE_SDR
+	int cur_sdr, loc = -1;
+#endif
 	const float *varr, *norm;
 
 	varr = cmesh_attrib_ro(cm, CMESH_ATTR_VERTEX);
@@ -1278,12 +1474,14 @@ void cmesh_draw_normals(const struct cmesh *cm, float len)
 	vert_nelem = cm->vattr[CMESH_ATTR_VERTEX].nelem;
 	norm_nelem = cm->vattr[CMESH_ATTR_NORMAL].nelem;
 
+#ifdef USE_SDR
 	glGetIntegerv(GL_CURRENT_PROGRAM, &cur_sdr);
 	if(cur_sdr && use_custom_sdr_attr) {
 		if((loc = sdr_loc[CMESH_ATTR_VERTEX]) < 0) {
 			return;
 		}
 	}
+#endif
 
 	glBegin(GL_LINES);
 	for(i=0; i<cm->nverts; i++) {
@@ -1296,13 +1494,17 @@ void cmesh_draw_normals(const struct cmesh *cm, float len)
 		endy = y + norm[i * norm_nelem + 1] * len;
 		endz = z + norm[i * norm_nelem + 2] * len;
 
+#ifdef USE_SDR
 		if(loc == -1) {
+#endif
 			glVertex3f(x, y, z);
 			glVertex3f(endx, endy, endz);
+#ifdef USE_SDR
 		} else {
 			glVertexAttrib3f(loc, x, y, z);
 			glVertexAttrib3f(loc, endx, endy, endz);
 		}
+#endif
 	}
 	glEnd();
 #endif	/* GL_ES_VERSION_2_0 */
@@ -1311,8 +1513,10 @@ void cmesh_draw_normals(const struct cmesh *cm, float len)
 void cmesh_draw_tangents(const struct cmesh *cm, float len)
 {
 #ifndef GL_ES_VERSION_2_0
-	int i, cur_sdr, vert_nelem, tang_nelem;
-	int loc = -1;
+	int i, vert_nelem, tang_nelem;
+#ifdef USE_SDR
+	int cur_sdr, loc = -1;
+#endif
 	const float *varr, *tang;
 
 	varr = cmesh_attrib_ro(cm, CMESH_ATTR_VERTEX);
@@ -1322,12 +1526,14 @@ void cmesh_draw_tangents(const struct cmesh *cm, float len)
 	vert_nelem = cm->vattr[CMESH_ATTR_VERTEX].nelem;
 	tang_nelem = cm->vattr[CMESH_ATTR_TANGENT].nelem;
 
+#ifdef USE_SDR
 	glGetIntegerv(GL_CURRENT_PROGRAM, &cur_sdr);
 	if(cur_sdr && use_custom_sdr_attr) {
 		if((loc = sdr_loc[CMESH_ATTR_VERTEX]) < 0) {
 			return;
 		}
 	}
+#endif
 
 	glBegin(GL_LINES);
 	for(i=0; i<cm->nverts; i++) {
@@ -1340,13 +1546,17 @@ void cmesh_draw_tangents(const struct cmesh *cm, float len)
 		endy = y + tang[i * tang_nelem + 1] * len;
 		endz = z + tang[i * tang_nelem + 2] * len;
 
+#ifdef USE_SDR
 		if(loc == -1) {
+#endif
 			glVertex3f(x, y, z);
 			glVertex3f(endx, endy, endz);
+#ifdef USE_SDR
 		} else {
 			glVertexAttrib3f(loc, x, y, z);
 			glVertexAttrib3f(loc, endx, endy, endz);
 		}
+#endif
 	}
 	glEnd();
 #endif	/* GL_ES_VERSION_2_0 */
@@ -1354,8 +1564,8 @@ void cmesh_draw_tangents(const struct cmesh *cm, float len)
 
 static void update_buffers(struct cmesh *cm)
 {
+#ifdef USE_VBO
 	int i;
-
 	for(i=0; i<CMESH_NUM_ATTR; i++) {
 		if(cmesh_has_attrib(cm, i) && !cm->vattr[i].vbo_valid) {
 			glBindBuffer(GL_ARRAY_BUFFER, cm->vattr[i].vbo);
@@ -1373,8 +1583,23 @@ static void update_buffers(struct cmesh *cm)
 		cm->ibo_valid = 1;
 		glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
 	}
+
+#elif defined(USE_DLIST)
+	static int updating;
+
+	if(!cm->dlist && !updating) {
+		int dlist = glGenLists(1);
+		glNewList(dlist, GL_COMPILE);
+		updating = 1;
+		cmesh_draw(cm);
+		updating = 0;
+		glEndList();
+		cm->dlist = dlist;
+	}
+#endif
 }
 
+#ifdef USE_VBO
 static void update_wire_ibo(struct cmesh *cm)
 {
 	int i, num_faces;
@@ -1427,6 +1652,7 @@ static void update_wire_ibo(struct cmesh *cm)
 	cm->wire_ibo_valid = 1;
 	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
 }
+#endif	/* USE_VBO */
 
 static void calc_aabb(struct cmesh *cm)
 {
@@ -1583,7 +1809,6 @@ int cmesh_dump_obj_file(const struct cmesh *cm, FILE *fp, int voffs)
 	static const char *fmtstr[] = {" %u", " %u//%u", " %u/%u", " %u/%u/%u"};
 	int i, j, num, nelem;
 	unsigned int aflags = 0;
-	const struct submesh *sub = cm->sublist;
 
 	if(!cmesh_has_attrib(cm, CMESH_ATTR_VERTEX)) {
 		return -1;
@@ -1630,11 +1855,6 @@ int cmesh_dump_obj_file(const struct cmesh *cm, FILE *fp, int voffs)
 		assert(numidx % 3 == 0);
 
 		for(i=0; i<numtri; i++) {
-			if(sub && sub->istart <= *idxptr) {
-				fprintf(fp, "o %s\n", sub->name);
-				sub = sub->next;
-			}
-
 			fputc('f', fp);
 			for(j=0; j<3; j++) {
 				unsigned int idx = *idxptr++ + 1 + voffs;
@@ -1646,11 +1866,6 @@ int cmesh_dump_obj_file(const struct cmesh *cm, FILE *fp, int voffs)
 		int numtri = cm->nverts / 3;
 		unsigned int idx = 1 + voffs;
 		for(i=0; i<numtri; i++) {
-			if(sub && sub->vstart == idx - 1) {
-				fprintf(fp, "o %s\n", sub->name);
-				sub = sub->next;
-			}
-
 			fputc('f', fp);
 			for(j=0; j<3; j++) {
 				fprintf(fp, fmtstr[aflags], idx, idx, idx);
